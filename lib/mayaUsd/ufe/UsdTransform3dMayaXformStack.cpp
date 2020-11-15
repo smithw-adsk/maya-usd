@@ -23,8 +23,11 @@
 #include <maya/MEulerRotation.h>
 
 #include <map>
+#include <functional>
 
 namespace {
+
+using OpFunc = std::function<UsdGeomXformOp()>;
 
 using namespace MayaUsd::ufe;
 
@@ -326,11 +329,11 @@ template <class V> class UsdVecOpUndoableCmd : public UsdTRSUndoableCmdBase
 {
 public:
     UsdVecOpUndoableCmd(
-        const V&              v,
-        const Ufe::Path&      path,
-        const UsdGeomXformOp& op,
-        const UsdTimeCode&    writeTime)
-        : UsdTRSUndoableCmdBase(VtValue(v), path, op, writeTime)
+        const V&           v,
+        const Ufe::Path&   path,
+        OpFunc             opFunc,
+        const UsdTimeCode& writeTime)
+        : UsdTRSUndoableCmdBase(VtValue(v), path, opFunc(), writeTime)
     {
     }
 
@@ -348,13 +351,13 @@ class UsdRotateOpUndoableCmd : public UsdTRSUndoableCmdBase
 {
 public:
     UsdRotateOpUndoableCmd(
-        const GfVec3f&        r,
-        const Ufe::Path&      path,
-        const UsdGeomXformOp& op,
-        CvtRotXYZToAttrFn     cvt,
-        const UsdTimeCode&    writeTime)
-        : UsdTRSUndoableCmdBase(VtValue(r), path, op, writeTime)
-        , _cvtRotXYZToAttr(cvt)
+        const GfVec3f&     r,
+        const Ufe::Path&   path,
+        OpFunc             opFunc,
+        CvtRotXYZToAttrFn  cvt,
+        const UsdTimeCode& writeTime)
+      : UsdTRSUndoableCmdBase(VtValue(r), path, opFunc(), writeTime)
+      , _cvtRotXYZToAttr(cvt)
     {
     }
 
@@ -442,46 +445,36 @@ UsdTransform3dMayaXformStack::translateCmd(double x, double y, double z)
 Ufe::RotateUndoableCommand::Ptr
 UsdTransform3dMayaXformStack::rotateCmd(double x, double y, double z)
 {
-    // If there is no rotate transform op yet, create it.
-    UsdGeomXformOp    r;
-    GfVec3f           v(x, y, z);
-    CvtRotXYZToAttrFn cvt = toXYZ; // No conversion is default.
-    if (!hasOp(NdxRotate)) {
-        // Use notification guard, otherwise will generate one notification for
-        // the xform op add, and another for the reorder.
+    GfVec3f v(x, y, z);
+    bool hasRotate = hasOp(NdxRotate);
+    // If there is no rotate transform op, we will create a RotXYZ.
+    CvtRotXYZToAttrFn cvt = hasRotate ?
+        getCvtRotXYZToAttrFn(getOp(NdxRotate).GetOpName()) : toXYZ;
+    OpFunc f = hasRotate ? OpFunc([this](){ return getOp(NdxRotate); }) :
+        OpFunc([this, v](){
+        // Use notification guard, otherwise will generate one notification
+        // for the xform op add, and another for the reorder.
         InTransform3dChange guard(path());
-        r = _xformable.AddRotateXYZOp();
-        if (!TF_VERIFY(r)) {
-            return nullptr;
-        }
+        auto r = _xformable.AddRotateXYZOp(); TF_AXIOM(r);
         r.Set(v);
         setXformOpOrder();
-    } else {
-        r = getOp(NdxRotate);
-        cvt = getCvtRotXYZToAttrFn(r.GetOpName());
-    }
+        return r; });
 
-    return std::make_shared<UsdRotateOpUndoableCmd>(v, path(), r, cvt, UsdTimeCode::Default());
+    return std::make_shared<UsdRotateOpUndoableCmd>(v, path(), std::move(f), cvt, UsdTimeCode::Default());
 }
 
 Ufe::ScaleUndoableCommand::Ptr UsdTransform3dMayaXformStack::scaleCmd(double x, double y, double z)
 {
-    // If there is no scale transform op yet, create it.
-    UsdGeomXformOp s;
-    GfVec3f        v(x, y, z);
-    if (!hasOp(NdxScale)) {
+    GfVec3f v(x, y, z);
+    OpFunc f = hasOp(NdxScale) ? OpFunc([this](){ return getOp(NdxScale); }) :
+    OpFunc([this, v]() {
         InTransform3dChange guard(path());
-        s = _xformable.AddScaleOp();
-        if (!TF_VERIFY(s)) {
-            return nullptr;
-        }
+        auto s = _xformable.AddScaleOp(); TF_AXIOM(s);
         s.Set(v);
         setXformOpOrder();
-    } else {
-        s = getOp(NdxScale);
-    }
+        return s; });
 
-    return std::make_shared<UsdVecOpUndoableCmd<GfVec3f>>(v, path(), s, UsdTimeCode::Default());
+    return std::make_shared<UsdVecOpUndoableCmd<GfVec3f>>(v, path(), std::move(f), UsdTimeCode::Default());
 }
 
 Ufe::TranslateUndoableCommand::Ptr
@@ -559,58 +552,46 @@ Ufe::SetVector3dUndoableCommand::Ptr UsdTransform3dMayaXformStack::setVector3dCm
     const TfToken& attrName,
     const TfToken& opSuffix)
 {
-    UsdGeomXformOp op;
-
-    // If the attribute doesn't exist yet, create it.
     auto attr = prim().GetAttribute(attrName);
-    if (!attr) {
+    OpFunc f = attr ? OpFunc([this, attr](){ return UsdGeomXformOp(attr); }) :
+    OpFunc([this, opSuffix, v](){
         InTransform3dChange guard(path());
-        op = _xformable.AddTranslateOp(OpPrecision<V>::precision, opSuffix);
-        if (!TF_VERIFY(op)) {
-            return nullptr;
-        }
+        auto op = _xformable.AddTranslateOp(
+                OpPrecision<V>::precision, opSuffix); TF_AXIOM(op);
         op.Set(v);
         setXformOpOrder();
-    } else {
-        op = UsdGeomXformOp(attr);
-        TF_AXIOM(op);
-    }
+        return op; });
 
-    return std::make_shared<UsdVecOpUndoableCmd<V>>(v, path(), op, UsdTimeCode::Default());
+    return std::make_shared<UsdVecOpUndoableCmd<V>>(v, path(), std::move(f), UsdTimeCode::Default());
 }
 
 Ufe::TranslateUndoableCommand::Ptr
 UsdTransform3dMayaXformStack::pivotCmd(const TfToken& pvtOpSuffix, double x, double y, double z)
 {
     auto pvtAttrName = UsdGeomXformOp::GetOpName(UsdGeomXformOp::TypeTranslate, pvtOpSuffix);
-    UsdGeomXformOp p;
 
-    // If the pivot attribute pair doesn't exist yet, create it.
-    auto    attr = prim().GetAttribute(pvtAttrName);
     GfVec3f v(x, y, z);
-    if (!attr) {
-        // Without a notification guard each operation (each transform op
-        // addition, setting the attribute value, and setting the transform op
-        // order) will notify.  Observers would see an object in an inconsistent
-        // state, especially after pivot is added but before its inverse is
-        // added --- this does not match the Maya transform stack.  Use of
-        // SdfChangeBlock is discouraged when calling USD APIs above Sdf, so
-        // use our own guard.
-        InTransform3dChange guard(path());
-        p = _xformable.AddTranslateOp(UsdGeomXformOp::PrecisionFloat, pvtOpSuffix);
-        auto pInv = _xformable.AddTranslateOp(
-            UsdGeomXformOp::PrecisionFloat, pvtOpSuffix, /* isInverseOp */ true);
-        if (!TF_VERIFY(p && pInv)) {
-            return nullptr;
-        }
-        p.Set(v);
-        setXformOpOrder();
-    } else {
-        p = UsdGeomXformOp(attr);
-        TF_AXIOM(p);
-    }
+    auto attr = prim().GetAttribute(pvtAttrName);
+    OpFunc f = attr ? OpFunc([this, attr](){ return UsdGeomXformOp(attr); }) :
+        OpFunc([this, pvtOpSuffix, v](){
+            // Without a notification guard each operation (each transform op
+            // addition, setting the attribute value, and setting the transform
+            // op order) will notify.  Observers would see an object in an
+            // inconsistent state, especially after pivot is added but before
+            // its inverse is added --- this does not match the Maya transform
+            // stack.  Use of SdfChangeBlock is discouraged when calling USD
+            // APIs above Sdf, so use our own guard.
+            InTransform3dChange guard(path());
+            auto p = _xformable.AddTranslateOp(
+                UsdGeomXformOp::PrecisionFloat, pvtOpSuffix);
+            auto pInv = _xformable.AddTranslateOp(
+                UsdGeomXformOp::PrecisionFloat, pvtOpSuffix, /* isInverseOp */ true);
+            TF_AXIOM(p && pInv);
+            p.Set(v);
+            setXformOpOrder();
+            return p; });
 
-    return std::make_shared<UsdVecOpUndoableCmd<GfVec3f>>(v, path(), p, UsdTimeCode::Default());
+    return std::make_shared<UsdVecOpUndoableCmd<GfVec3f>>(v, path(), std::move(f), UsdTimeCode::Default());
 }
 
 void UsdTransform3dMayaXformStack::setXformOpOrder()
