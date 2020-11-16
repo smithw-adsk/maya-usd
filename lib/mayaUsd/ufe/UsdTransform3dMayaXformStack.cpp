@@ -258,34 +258,94 @@ Ufe::Transform3d::Ptr createTransform3d(
 class UsdTRSUndoableCmdBase : public Ufe::SetVector3dUndoableCommand
 {
 private:
-    UsdGeomXformOp    fOp;
     const UsdTimeCode fReadTime;
     const UsdTimeCode fWriteTime;
-    const VtValue     fPrevOpValue;
     const TfToken     fAttrName;
 
 public:
+
+    UsdGeomXformOp    _op;
+    VtValue           _prevOpValue;
+    VtValue           _newOpValue;
+
+	struct State {
+		virtual const char* name() const = 0;
+		virtual void handleUndo(UsdTRSUndoableCmdBase*) {
+			TF_CODING_ERROR("handleUndo() called for illegal state '%s' in UsdTRSUndoableCmdBase", name());
+		} 
+		virtual void handleSet(UsdTRSUndoableCmdBase*, const VtValue&) {
+			TF_CODING_ERROR("handleSet() called for illegal state '%s' in UsdTRSUndoableCmdBase", name()); }
+	};
+
+	struct InitialState : public State {
+		const char* name() const override { return "initial"; }
+		void handleUndo(UsdTRSUndoableCmdBase* cmd) override {
+			// Maya triggers an undo on command creation, ignore it.
+			cmd->_state = &UsdTRSUndoableCmdBase::_initialUndoCalledState;
+		}
+		void handleSet(UsdTRSUndoableCmdBase* cmd, const VtValue& v) override {
+			// Going from initial to executing / executed state, save value.
+			cmd->_prevOpValue = getValue(cmd->_op.GetAttr(), cmd->readTime());
+			cmd->_newOpValue  = v;
+			cmd->setValue(v);
+			cmd->_state = &UsdTRSUndoableCmdBase::_executeState;
+		}
+	};
+
+	struct InitialUndoCalledState : public State {
+		const char* name() const override { return "initial undo called"; }
+		void handleSet(UsdTRSUndoableCmdBase* cmd, const VtValue&) override {
+			// Maya triggers a redo on command creation, ignore it.
+			cmd->_state = &UsdTRSUndoableCmdBase::_initialState;
+		}
+	};
+
+	struct ExecuteState : public State {
+		const char* name() const override { return "execute"; }
+		void handleUndo(UsdTRSUndoableCmdBase* cmd) override {
+			cmd->recreateOp();
+			cmd->setValue(cmd->_prevOpValue);
+			cmd->_state = &UsdTRSUndoableCmdBase::_undoneState;
+		}
+		void handleSet(UsdTRSUndoableCmdBase* cmd, const VtValue& v) override {
+			cmd->_newOpValue = v;
+			cmd->setValue(v);
+		}
+	};
+
+	struct UndoneState : public State {
+		const char* name() const override { return "undone"; }
+		void handleSet(UsdTRSUndoableCmdBase* cmd, const VtValue&) override {
+			// Can ignore the value, we already have it --- or assert they're
+			// equal, perhaps.
+			cmd->recreateOp();
+			cmd->setValue(cmd->_newOpValue);
+			cmd->_state = &UsdTRSUndoableCmdBase::_redoneState;
+		}
+	};
+
+	struct RedoneState : public State {
+		const char* name() const override { return "redone"; }
+		void handleUndo(UsdTRSUndoableCmdBase* cmd) override {
+			cmd->recreateOp();
+			cmd->setValue(cmd->_prevOpValue);
+			cmd->_state = &UsdTRSUndoableCmdBase::_undoneState;
+		}
+	};
+
     UsdTRSUndoableCmdBase(
         const VtValue&        newOpValue,
         const Ufe::Path&      path,
         const UsdGeomXformOp& op,
         const UsdTimeCode&    writeTime_)
         : Ufe::SetVector3dUndoableCommand(path)
-        , fOp(op)
-        ,
         // Always read from proxy shape time.
-        fReadTime(getTime(path))
+        , fReadTime(getTime(path))
         , fWriteTime(writeTime_)
-        , fPrevOpValue(getValue(op.GetAttr(), readTime()))
         , fAttrName(op.GetOpName())
-        , fNewOpValue(newOpValue)
-    {
-    }
-
-    // Have separate execute override which is value-only, as default execute()
-    // calls redo, and undo / redo will eventually not be value only and will
-    // support propertySpec / primSpec management.
-    void execute() override { setValue(fNewOpValue); }
+        , _op(op)
+        , _newOpValue(newOpValue)
+    {}
 
     void recreateOp()
     {
@@ -296,32 +356,37 @@ public:
         TF_AXIOM(prim);
         auto attr = prim.GetAttribute(fAttrName);
         TF_AXIOM(attr);
-        fOp = UsdGeomXformOp(attr);
+        _op = UsdGeomXformOp(attr);
     }
 
-    void undo() override
-    {
-        // Re-create the XformOp, as the underlying prim may have been
-        // invalidated by later commands.
-        recreateOp();
-        setValue(fPrevOpValue);
-    }
+    void undo() override { _state->handleUndo(this); }
+
     void redo() override
     {
-        // Re-create the XformOp, as the underlying prim may have been
-        // invalidated by earlier commands.
-        recreateOp();
-        setValue(fNewOpValue);
+		TF_CODING_ERROR("Illegal call to redo() in UsdTRSUndoableCmdBase.");
     }
 
-    void setValue(const VtValue& v) { fOp.GetAttr().Set(v, fWriteTime); }
+	void handleSet(const VtValue& v) { _state->handleSet(this, v); }
+
+    void setValue(const VtValue& v) { _op.GetAttr().Set(v, fWriteTime); }
 
     UsdTimeCode readTime() const { return fReadTime; }
     UsdTimeCode writeTime() const { return fWriteTime; }
 
-protected:
-    VtValue fNewOpValue;
+	static InitialState           _initialState;
+	static InitialUndoCalledState _initialUndoCalledState;
+	static ExecuteState           _executeState;
+	static UndoneState            _undoneState;
+	static RedoneState            _redoneState;
+
+	State* _state{&_initialState};
 };
+
+UsdTRSUndoableCmdBase::InitialState UsdTRSUndoableCmdBase::_initialState;
+UsdTRSUndoableCmdBase::InitialUndoCalledState UsdTRSUndoableCmdBase::_initialUndoCalledState;
+UsdTRSUndoableCmdBase::ExecuteState UsdTRSUndoableCmdBase::_executeState;
+UsdTRSUndoableCmdBase::UndoneState  UsdTRSUndoableCmdBase::_undoneState;
+UsdTRSUndoableCmdBase::RedoneState  UsdTRSUndoableCmdBase::_redoneState;
 
 // UsdRotatePivotTranslateUndoableCmd uses hard-coded USD common transform API
 // single pivot attribute name, not reusable.
@@ -334,15 +399,14 @@ public:
         OpFunc             opFunc,
         const UsdTimeCode& writeTime)
         : UsdTRSUndoableCmdBase(VtValue(v), path, opFunc(), writeTime)
-    {
-    }
+    {}
 
     // Executes the command by setting the translation onto the transform op.
     bool set(double x, double y, double z) override
     {
-        fNewOpValue = V(x, y, z);
-
-        setValue(fNewOpValue);
+        VtValue v;
+        v = V(x, y, z);
+        handleSet(v);
         return true;
     }
 };
@@ -358,15 +422,14 @@ public:
         const UsdTimeCode& writeTime)
       : UsdTRSUndoableCmdBase(VtValue(r), path, opFunc(), writeTime)
       , _cvtRotXYZToAttr(cvt)
-    {
-    }
+    {}
 
     // Executes the command by setting the rotation onto the transform op.
     bool set(double x, double y, double z) override
     {
-        fNewOpValue = _cvtRotXYZToAttr(x, y, z);
-
-        setValue(fNewOpValue);
+        VtValue v;
+        v = _cvtRotXYZToAttr(x, y, z);
+        handleSet(v);
         return true;
     }
 
