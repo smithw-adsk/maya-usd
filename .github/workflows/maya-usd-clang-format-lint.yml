@@ -15,7 +15,7 @@ jobs:
   clang_format_linter:
       timeout-minutes: 30
       runs-on: ubuntu-latest
-      if: ${{ github.event.assignee.login == 'smithw-adsk' }}
+      if: ${{ github.event.assignee.login == 'smithw-adsk_disable_trigger' }}
       steps:
       - uses: actions/checkout@v2
       - uses: DoozyX/clang-format-lint-action@v0.11
